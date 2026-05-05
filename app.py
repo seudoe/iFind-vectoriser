@@ -54,7 +54,7 @@ async def lifespan(app: FastAPI):
         import json
 
         tfidf_path    = os.getenv("TFIDF_PATH",    "task1-tfidf_vectorizer.pkl")
-        bert_path     = os.getenv("BERT_PATH",     "bert_model_saved")
+        bert_path     = os.getenv("BERT_PATH",     "sentence-transformers/all-mpnet-base-v2")  # download from HF
         clusters_path = os.getenv("CLUSTERS_PATH", "skill_clusters.json")
         s2c_path      = os.getenv("S2C_PATH",      "skill_to_category.json")
 
