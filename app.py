@@ -138,15 +138,46 @@ def _encode_text(text: str, boost: float = 0.15) -> Dict[str, List[float]]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class InternshipItem(BaseModel):
-    id:          str = Field(..., description="MongoDB _id of the internship")
-    title:       str
-    description: str
+    """
+    Accepts either the clean API shape OR the raw MongoDB internship document.
+
+    Clean shape:   { id, title, description }
+    MongoDB shape: { _id: {$oid:...} | str, name, summary, ... }
+
+    Extra fields are silently ignored.
+    """
+    model_config = {"extra": "ignore"}
+
+    # Clean API fields
+    id:          str | None = Field(None)
+    title:       str | None = Field(None)
+    description: str | None = Field(None)
+
+    # Raw MongoDB fields (your Internship document)
+    _id:     Any | None = None
+    name:    str | None = None
+    summary: str | None = None
+
+    def resolved_id(self) -> str:
+        """Return the internship ID regardless of which field it came in as."""
+        if self.id:
+            return self.id
+        raw = self._id
+        if isinstance(raw, dict):
+            return raw.get("$oid", str(raw))
+        return str(raw) if raw else "unknown"
+
+    def resolved_title(self) -> str:
+        return self.title or self.name or "Untitled"
+
+    def resolved_description(self) -> str:
+        return self.description or self.summary or ""
 
 
 class EncodeInternshipsRequest(BaseModel):
     internships:  List[InternshipItem] = Field(
         ...,
-        description=f"Max {MAX_BATCH} internships per call",
+        description=f"Max {MAX_BATCH} internships per call. Accepts clean {{id,title,description}} or raw MongoDB documents.",
     )
     boost_weight: float = Field(0.15, description="Skill cluster boost magnitude")
 
@@ -234,17 +265,17 @@ def encode_internships(req: EncodeInternshipsRequest):
 
     for item in req.internships:
         # Combine title + description for richer signal
-        full_text = f"{item.title}. {item.description}"
+        full_text = f"{item.resolved_title()}. {item.resolved_description()}"
         try:
             vecs = _encode_text(full_text, boost=req.boost_weight)
             results.append(InternshipVectors(
-                id    = item.id,
+                id    = item.resolved_id(),
                 tfidf = vecs["tfidf"],
                 bert  = vecs["bert"],
             ))
         except Exception as e:
-            log.error(f"Failed to encode internship {item.id}: {e}")
-            raise HTTPException(status_code=500, detail=f"Encoding failed for id={item.id}: {e}")
+            log.error(f"Failed to encode internship {item.resolved_id()}: {e}")
+            raise HTTPException(status_code=500, detail=f"Encoding failed for id={item.resolved_id()}: {e}")
 
     log.info(f"Encoded {len(results)} internship(s)")
     return EncodeInternshipsResponse(encoded=len(results), vectors=results)
