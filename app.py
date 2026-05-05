@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Union
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -146,26 +146,32 @@ class InternshipItem(BaseModel):
 
     Extra fields are silently ignored.
     """
-    model_config = {"extra": "ignore"}
+    model_config = {"extra": "ignore", "populate_by_name": True}
 
-    # Clean API fields
     id:          str | None = Field(None)
     title:       str | None = Field(None)
     description: str | None = Field(None)
+    name:        str | None = Field(None)
+    summary:     str | None = Field(None)
 
-    # Raw MongoDB fields (your Internship document)
-    _id:     Any | None = None
-    name:    str | None = None
-    summary: str | None = None
+    # _id comes in as { "$oid": "..." } or a plain string — resolved in validator
+    _resolved_id: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def extract_mongo_id(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            raw_id = data.get("_id")
+            if raw_id is not None:
+                if isinstance(raw_id, dict):
+                    # { "$oid": "664a..." }
+                    data["id"] = raw_id.get("$oid", str(raw_id))
+                else:
+                    data["id"] = str(raw_id)
+        return data
 
     def resolved_id(self) -> str:
-        """Return the internship ID regardless of which field it came in as."""
-        if self.id:
-            return self.id
-        raw = self._id
-        if isinstance(raw, dict):
-            return raw.get("$oid", str(raw))
-        return str(raw) if raw else "unknown"
+        return self.id or "unknown"
 
     def resolved_title(self) -> str:
         return self.title or self.name or "Untitled"
