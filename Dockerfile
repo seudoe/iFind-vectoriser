@@ -17,7 +17,7 @@ COPY app.py .
 COPY task1-tfidf_vectorizer.pkl .
 COPY skill_clusters.json .
 COPY skill_to_category.json .
-COPY bert_model_saved/ ./bert_model_saved/
+# bert_model_saved is NOT copied — model is downloaded from HuggingFace on first startup
 
 # HF Spaces expects port 7860
 EXPOSE 7860
