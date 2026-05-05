@@ -1,0 +1,8 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.8.2
+sentence-transformers==3.0.1
+scikit-learn==1.5.1
+pandas==2.2.2
+numpy==1.26.4
+torch==2.3.1
