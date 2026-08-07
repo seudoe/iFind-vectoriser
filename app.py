@@ -327,3 +327,23 @@ def encode_resume(req: EncodeResumeRequest):
 
     log.info("Resume encoded successfully")
     return EncodeResumeResponse(tfidf=vecs["tfidf"], bert=vecs["bert"])
+
+
+@app.post(
+    "/vectorize-hnsw",
+    tags=["pipeline"],
+    summary="Process internships.mod-unvectorised → vectorise, HNSW graph, move to internships",
+)
+def vectorize_hnsw_endpoint():
+    """
+    Triggers the internship vectorization & HNSW graph maintenance pipeline.
+    Reads from 'internships.mod-unvectorised', encodes, inserts into HNSW graph,
+    persists in 'internships.graph', moves to 'internships', and cleans up.
+    """
+    try:
+        from vectorizer_hnsw_pipeline import run_internship_vectorizer_hnsw_pipeline
+        stats = run_internship_vectorizer_hnsw_pipeline()
+        return {"status": "ok", "stats": stats}
+    except Exception as e:
+        log.error(f"HNSW Vectorizer Pipeline failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
