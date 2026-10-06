@@ -50,51 +50,18 @@ https://YOUR_USERNAME-ifind-recommender.hf.space
 
 ## Endpoints
 
-| Method | Path        | What it does                              |
-|--------|-------------|-------------------------------------------|
-| GET    | /health     | Check if models are loaded                |
-| POST   | /recommend  | Score resume against N internships        |
-| POST   | /score      | Score resume against 1 internship         |
-| GET    | /docs       | Auto-generated Swagger UI                 |
+| Method | Path | What it does |
+|--------|------|--------------|
+| GET | /health | Models loaded? |
+| POST | /encode-internships | Batch encode internship text -> TF-IDF + BERT vectors |
+| POST | /encode-resume | Encode one resume. With `user_id` the vectors are saved on the student; with `recommend: true` the student is also run through the whole HNSW graph and `recommendedInternships` is saved |
+| POST | /vectorize-hnsw | Scraped internships: vectorize approved staged docs, add to the graph, move to `internships`; then every student is run through the graph (`recommend`, default true) |
+| POST | /vectorize-platform | Employer-posted internships (`internships.this-platform`): vectorize in place, add to the graph; then every student is run through the graph |
+| POST | /recommend-all | Run every student (or `user_ids`) through the graph (admin refresh) |
+| POST | /search-internships, /rebuild-graph | k-NN over the graph / rebuild it from stored vectors |
+| GET | /docs | Swagger UI |
 
-## Example call from Next.js
+Environment: `MONGODB_URI` (required, the vectoriser reads and writes the shared database), optional `MONGODB_DB_NAME` (default `ifind`).
 
-```typescript
-const res = await fetch("https://YOUR_USERNAME-ifind-recommender.hf.space/recommend", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
-    resume: parsedResumeData,   // the parsedData object from your MongoDB user doc
-    internships: [
-      { title: "Backend Intern", description: "Python, Django, REST APIs..." },
-      { title: "Data Science Intern", description: "pandas, scikit-learn, ML..." },
-    ],
-    threshold: 0.35,
-    resume_name: "John Doe",
-  }),
-});
-
-const data = await res.json();
-// data.results → sorted by final_score, each has recommended: true/false
-```
-
-## Resume input format
-
-You can send either:
-
-**Plain text** (simplest):
-```json
-{ "resume": "Python developer with 2 years experience in Django..." }
-```
-
-**Parsed JSON** (from your resume parser — uses all fields):
-```json
-{
-  "resume": {
-    "summary": "...",
-    "skills": [...],
-    "workHistory": [...],
-    "projects": [...]
-  }
-}
-```
+The recommendation code is `recommender.py` (moved here from `ifind/lib/recommendation`). Callers: internScraper
+(auto-approved scraped and employer posts) and ifind (moderator approvals, resume/profile changes, admin refresh).

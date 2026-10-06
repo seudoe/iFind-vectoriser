@@ -2,6 +2,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# hnswlib compiles a C++ extension
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/*
+
 # Install dependencies first (cached layer)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -12,6 +15,9 @@ COPY task2_module.py .
 COPY task3_internship_profiles_module.py .
 COPY task4_recommender.py .
 COPY app.py .
+COPY vectorizer_hnsw_pipeline.py .
+COPY recommender.py .
+COPY services.py .
 
 # Copy model artifacts
 COPY task1-tfidf_vectorizer.pkl .

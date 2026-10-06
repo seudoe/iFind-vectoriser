@@ -7,3 +7,6 @@ transformers==4.44.2
 scikit-learn==1.5.1
 pandas==2.2.2
 numpy==1.26.4
+pymongo==4.8.0
+python-dotenv==1.0.1
+hnswlib==0.8.0

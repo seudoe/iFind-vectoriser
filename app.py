@@ -1,13 +1,17 @@
 """
-app.py — Hybrid Internship Recommender API
-──────────────────────────────────────────
-Two endpoints only:
-
+app.py — iFind vectoriser: encoding, HNSW graph and student recommendations
+──────────────────────────────────────────────────────────────────────────
   POST /encode-internships  — batch encode internship descriptions → vectors
-  POST /encode-resume       — encode one user's resume → vectors
+  POST /encode-resume       — encode one resume → vectors; with user_id (+ recommend) it also saves them on the
+                              student and runs the student through the whole graph
+  POST /vectorize-hnsw      — scraped internships: vectorize approved staged docs, add to graph, move to
+                              `internships`, then run every student through the graph
+  POST /vectorize-platform  — employer-posted internships: vectorize in place, add to graph, then run every
+                              student through the graph
+  POST /recommend-all       — run every student (or user_ids) through the graph (admin refresh)
+  POST /search-internships, /rebuild-graph
 
-Vectors are returned to Next.js which stores them in MongoDB.
-All cosine similarity matching happens on the Next.js side (no API call needed).
+The recommendation code is recommender.py. Full-graph traversal per student happens only on those triggers.
 
 Deploy: Hugging Face Spaces → Docker → port 7860
 """
@@ -16,13 +20,15 @@ import os
 import sys
 import logging
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+from services import allowed_origins
 
 from task1_module import flatten, tfidf_transform, load_vectorizer
 from task2_module import load_bert_model, bert_transform, bert_batch_transform
@@ -87,14 +93,14 @@ async def lifespan(app: FastAPI):
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title    = "iFind Recommender — Vector Encoder",
+    title    = "iFind Vectoriser",
     version  = "2.0.0",
     lifespan = lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins     = ["*"],   # lock to your Next.js domain in production
+    allow_origins     = allowed_origins(),   # MAIN_PROJECT_URL + INTERNSCRAPER_URL (empty = no browser origin)
     allow_credentials = True,
     allow_methods     = ["*"],
     allow_headers     = ["*"],
@@ -209,11 +215,21 @@ class EncodeResumeRequest(BaseModel):
         description="Plain text string OR the parsedData JSON from your resume parser",
     )
     boost_weight: float = Field(0.15)
+    user_id: Optional[str] = Field(
+        default=None,
+        description="Student _id. When set, the vectors are saved on the user (resume.tfidf_vector / bert_vector).",
+    )
+    recommend: bool = Field(
+        default=False,
+        description="With user_id: after vectorisation run the student through the WHOLE graph and save "
+                    "recommendedInternships.",
+    )
 
 
 class EncodeResumeResponse(BaseModel):
     tfidf: List[float]   # 15,000 floats
     bert:  List[float]   # 768 floats
+    recommended: Optional[int] = None   # how many internships were recommended (only when recommend ran)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -225,7 +241,7 @@ def root():
     return {
         "status":  "ready" if MODELS.get("ready") else "loading",
         "service": "iFind Vector Encoder",
-        "endpoints": ["/encode-internships", "/encode-resume"],
+        "endpoints": ["/encode-internships", "/encode-resume", "/vectorize-hnsw", "/vectorize-platform", "/recommend-all"],
     }
 
 
@@ -326,24 +342,154 @@ def encode_resume(req: EncodeResumeRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
     log.info("Resume encoded successfully")
-    return EncodeResumeResponse(tfidf=vecs["tfidf"], bert=vecs["bert"])
+    recommended = None
+    if req.user_id:
+        try:
+            from bson import ObjectId
+            from vectorizer_hnsw_pipeline import get_db
+            db = get_db()
+            db["users"].update_one(
+                {"_id": ObjectId(req.user_id)},
+                {"$set": {"resume.tfidf_vector": vecs["tfidf"], "resume.bert_vector": vecs["bert"]}},
+            )
+            if req.recommend:
+                from recommender import recommend_user
+                recommended = recommend_user(req.user_id, vecs["tfidf"], vecs["bert"], db)
+        except Exception as e:
+            log.error(f"Saving resume vectors / recommending failed: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+    return EncodeResumeResponse(tfidf=vecs["tfidf"], bert=vecs["bert"], recommended=recommended)
+
+
+class VectorizeHnswRequest(BaseModel):
+    ids: Optional[List[str]] = Field(default=None, description="Restrict to these staging _ids")
+    background: bool = Field(default=False, description="Return immediately and run server-side")
+    recommend: bool = Field(default=True, description="After indexing, run every student through the graph (in the background)")
+
+
+def _scraped_then_recommend(ids, recommend: bool):
+    from recommender import run_fanout
+    from vectorizer_hnsw_pipeline import run_internship_vectorizer_hnsw_pipeline
+    stats = run_internship_vectorizer_hnsw_pipeline(ids=ids)
+    if recommend and stats.get("processed"):
+        run_fanout()
+    return stats
+
+
+class SearchRequest(BaseModel):
+    vector: List[float]
+    k: int = Field(default=20, ge=1, le=200)
 
 
 @app.post(
     "/vectorize-hnsw",
     tags=["pipeline"],
-    summary="Process internships.mod-unvectorised → vectorise, HNSW graph, move to internships",
+    summary="Vectorise APPROVED internships.mod-unvectorised docs, insert into HNSW graph, move to internships",
 )
-def vectorize_hnsw_endpoint():
+def vectorize_hnsw_endpoint(req: VectorizeHnswRequest = VectorizeHnswRequest(), background_tasks: BackgroundTasks = None):
     """
-    Triggers the internship vectorization & HNSW graph maintenance pipeline.
-    Reads from 'internships.mod-unvectorised', encodes, inserts into HNSW graph,
-    persists in 'internships.graph', moves to 'internships', and cleans up.
+    Processes only moderation.status in (auto_approved, manually_approved).
+    Non-approved docs stay in staging untouched. Afterwards (recommend=true) every student is run through the graph.
     """
+    from vectorizer_hnsw_pipeline import run_internship_vectorizer_hnsw_pipeline
+
+    if req.background and background_tasks is not None:
+        background_tasks.add_task(_scraped_then_recommend, req.ids, req.recommend)
+        return {"status": "queued"}
     try:
-        from vectorizer_hnsw_pipeline import run_internship_vectorizer_hnsw_pipeline
-        stats = run_internship_vectorizer_hnsw_pipeline()
+        stats = run_internship_vectorizer_hnsw_pipeline(ids=req.ids)
+        if req.recommend and stats.get("processed") and background_tasks is not None:
+            from recommender import run_fanout
+            background_tasks.add_task(run_fanout)
         return {"status": "ok", "stats": stats}
     except Exception as e:
         log.error(f"HNSW Vectorizer Pipeline failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class VectorizePlatformRequest(BaseModel):
+    ids: List[str] = Field(..., min_length=1, max_length=50, description="_ids in internships.this-platform")
+    background: bool = Field(default=False, description="Return immediately and run server-side")
+    recommend: bool = Field(default=True, description="After indexing, run every student through the graph (in the background)")
+
+
+def _platform_then_recommend(ids, recommend: bool):
+    from recommender import run_fanout
+    from vectorizer_hnsw_pipeline import run_platform_vectorizer_pipeline
+    stats = run_platform_vectorizer_pipeline(ids=ids)
+    if recommend and stats.get("processed"):
+        run_fanout()
+    return stats
+
+
+@app.post(
+    "/vectorize-platform",
+    tags=["pipeline"],
+    summary="Vectorise APPROVED employer-posted internships in place (internships.this-platform)",
+)
+def vectorize_platform_endpoint(req: VectorizePlatformRequest, background_tasks: BackgroundTasks = None):
+    """
+    ifind-source internships are not staged or moved: vectors are written onto the document where it lives and
+    its id is added to the HNSW graph. Only moderation.status in (auto_approved, manually_approved) is processed.
+    Afterwards (recommend=true) every student is run through the graph.
+    """
+    from vectorizer_hnsw_pipeline import run_platform_vectorizer_pipeline
+
+    if req.background and background_tasks is not None:
+        background_tasks.add_task(_platform_then_recommend, req.ids, req.recommend)
+        return {"status": "queued"}
+    try:
+        stats = run_platform_vectorizer_pipeline(ids=req.ids)
+        if req.recommend and stats.get("processed") and background_tasks is not None:
+            from recommender import run_fanout
+            background_tasks.add_task(run_fanout)
+        return {"status": "ok", "stats": stats}
+    except Exception as e:
+        log.error(f"Platform vectorizer failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class RecommendAllRequest(BaseModel):
+    user_ids: Optional[List[str]] = Field(default=None, max_length=500, description="Only these students; omit for everyone")
+    background: bool = Field(default=True, description="Return immediately and run server-side")
+
+
+@app.post(
+    "/recommend-all",
+    tags=["pipeline"],
+    summary="Run every student (or user_ids) through the whole HNSW graph and save their recommendations",
+)
+def recommend_all(req: RecommendAllRequest = RecommendAllRequest(), background_tasks: BackgroundTasks = None):
+    from recommender import run_fanout
+
+    if req.background and background_tasks is not None:
+        background_tasks.add_task(run_fanout, req.user_ids)
+        return {"status": "queued"}
+    try:
+        return {"status": "ok", "stats": run_fanout(req.user_ids)}
+    except Exception as e:
+        log.error(f"Recommend-all failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/search-internships", tags=["pipeline"], summary="k-NN over the internship HNSW graph")
+def search_internships(req: SearchRequest):
+    try:
+        from vectorizer_hnsw_pipeline import search_graph
+        return {"results": [{"id": i, "score": sc} for i, sc in search_graph(req.vector, req.k)]}
+    except Exception as e:
+        log.error(f"Graph search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/rebuild-graph", tags=["pipeline"], summary="Rebuild the HNSW graph from live internships' stored vectors")
+def rebuild_graph():
+    try:
+        from vectorizer_hnsw_pipeline import HNSWIndexManager, PIPELINE_LOCK, get_db
+        with PIPELINE_LOCK:
+            db = get_db()
+            n = HNSWIndexManager().rebuild_from_db(db)
+        return {"status": "ok", "indexed": n}
+    except Exception as e:
+        log.error(f"Graph rebuild failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))

@@ -1,0 +1,12 @@
+# secrets / local config
+.env
+.env.*
+**/.env
+
+# Python
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# The BERT model is downloaded from the Hugging Face hub at runtime; never commit it (model.safetensors is ~440 MB)
+bert_model_saved/
