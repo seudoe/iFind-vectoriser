@@ -38,11 +38,10 @@ from task3_internship_profiles_module import boost_tfidf_vector
 # Logging
 # ─────────────────────────────────────────────────────────────────────────────
 
-logging.basicConfig(
-    level  = logging.INFO,
-    format = "%(asctime)s  %(levelname)s  %(message)s",
-)
-log = logging.getLogger(__name__)
+from ifind_log import RequestLogMiddleware, get_logger, setup
+
+setup("vectoriser")
+log = get_logger("app")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Global model state — loaded ONCE at startup, reused for every request
@@ -65,22 +64,22 @@ async def lifespan(app: FastAPI):
         s2c_path      = os.getenv("S2C_PATH",      "skill_to_category.json")
 
         MODELS["tfidf"] = load_vectorizer(tfidf_path)
-        log.info(f"  TF-IDF loaded  vocab={len(MODELS['tfidf'].vocabulary_):,}")
+        log.info("TF-IDF loaded", extra={"f": {"vocab": len(MODELS["tfidf"].vocabulary_)}})
 
         MODELS["bert"] = load_bert_model(bert_path)
-        log.info("  BERT loaded")
+        log.info("BERT loaded")
 
         with open(clusters_path) as f:
             MODELS["clusters"] = json.load(f)
         with open(s2c_path) as f:
             MODELS["s2c"] = json.load(f)
-        log.info(f"  Clusters loaded  {len(MODELS['clusters'])} domains")
+        log.info("skill clusters loaded", extra={"f": {"domains": len(MODELS["clusters"])}})
 
         MODELS["ready"] = True
-        log.info("All models ready ✅")
+        log.ok("all models ready")
 
     except Exception as e:
-        log.error(f"Startup failed: {e}")
+        log.error("startup failed", extra={"f": {"error": str(e)}})
         MODELS["ready"] = False
         MODELS["error"] = str(e)
 
@@ -98,6 +97,7 @@ app = FastAPI(
     lifespan = lifespan,
 )
 
+app.add_middleware(RequestLogMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins     = allowed_origins(),   # MAIN_PROJECT_URL + INTERNSCRAPER_URL (empty = no browser origin)
@@ -299,7 +299,7 @@ def encode_internships(req: EncodeInternshipsRequest):
             log.error(f"Failed to encode internship {item.resolved_id()}: {e}")
             raise HTTPException(status_code=500, detail=f"Encoding failed for id={item.resolved_id()}: {e}")
 
-    log.info(f"Encoded {len(results)} internship(s)")
+    log.info("internships encoded", extra={"f": {"count": len(results)}})
     return EncodeInternshipsResponse(encoded=len(results), vectors=results)
 
 
@@ -341,7 +341,7 @@ def encode_resume(req: EncodeResumeRequest):
         log.error(f"Resume encoding failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-    log.info("Resume encoded successfully")
+    log.ok("resume encoded")
     recommended = None
     if req.user_id:
         try:

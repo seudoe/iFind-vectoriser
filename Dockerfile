@@ -13,8 +13,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY task1_module.py .
 COPY task2_module.py .
 COPY task3_internship_profiles_module.py .
-COPY task4_recommender.py .
 COPY app.py .
+COPY ifind_log.py .
 COPY vectorizer_hnsw_pipeline.py .
 COPY recommender.py .
 COPY services.py .

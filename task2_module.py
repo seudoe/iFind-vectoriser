@@ -1,4 +1,3 @@
-
 """
 task2_module.py
 ───────────────
@@ -8,6 +7,8 @@ Depends on: task1_module.py
 Usage:
     from task2_module import load_bert_model, bert_transform, bert_batch_transform
 """
+import logging
+
 
 import os
 import numpy as np
@@ -40,9 +41,9 @@ def load_bert_model(model_path: str = 'bert_model_saved', device: str = None):
     import torch
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f'Loading BERT model from: {model_path}  (device={device})')
+    logging.getLogger('task2').info('loading BERT model', extra={'f': {'path': model_path, 'device': device}})
     model = SentenceTransformer(model_path, device=device)
-    print(f'BERT loaded. Output dims: {model.get_sentence_embedding_dimension()}')
+    logging.getLogger('task2').info('BERT loaded', extra={'f': {'dims': model.get_sentence_embedding_dimension()}})
     return model
 
 
