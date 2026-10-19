@@ -46,6 +46,7 @@ def _visible_platform_filter() -> Dict[str, Any]:
         "status": "published",
         "moderation.status": {"$in": list(APPROVED_STATUSES)},
         "isActive": {"$ne": False},
+        "bannedByCompany": {"$ne": True},   # company banned by a moderator (ifind companies.restriction.status == "banned")
         "$or": [{"deadlineDate": None}, {"deadlineDate": {"$gt": now}}],
     }
 

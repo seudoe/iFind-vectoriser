@@ -232,7 +232,7 @@ class HNSWIndexManager:
         # Employer-posted internships: approved + vectorized, any non-draft status (visibility is checked at query time,
         # so a paused post that resumes is still in the graph)
         for doc in db[PLATFORM_COLLECTION].find(
-            {"bert_vector": {"$type": "array"}, "isActive": {"$ne": False}, "status": {"$ne": "draft"},
+            {"bert_vector": {"$type": "array"}, "isActive": {"$ne": False}, "bannedByCompany": {"$ne": True}, "status": {"$ne": "draft"},
              "moderation.status": {"$in": list(APPROVED_STATUSES)}},
             {"bert_vector": 1},
         ):
@@ -489,7 +489,7 @@ def run_platform_vectorizer_pipeline(
     with PIPELINE_LOCK:
         db = get_db(mongo_uri, db_name)
         col = db[PLATFORM_COLLECTION]
-        docs = list(col.find({"_id": {"$in": oids}, "moderation.status": {"$in": list(APPROVED_STATUSES)}}))
+        docs = list(col.find({"_id": {"$in": oids}, "bannedByCompany": {"$ne": True}, "moderation.status": {"$in": list(APPROVED_STATUSES)}}))
         stats["skipped"] += len(oids) - len(docs)
         if not docs:
             return stats
