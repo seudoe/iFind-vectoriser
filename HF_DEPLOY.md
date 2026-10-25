@@ -7,7 +7,6 @@ app.py
 task1_module.py
 task2_module.py
 task3_internship_profiles_module.py
-task4_recommender.py
 task1-tfidf_vectorizer.pkl
 skill_clusters.json
 skill_to_category.json
