@@ -1,0 +1,32 @@
+[project]
+name = "vectoriser"
+version = "0.1.0"
+description = "iFind vectoriser: TF-IDF + BERT encoding, HNSW graph, student recommendations"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "fastapi==0.115.0",
+    "uvicorn[standard]==0.30.6",
+    "pydantic==2.8.2",
+    "torch==2.3.1",
+    "sentence-transformers==3.3.1",
+    "transformers==4.44.2",
+    "scikit-learn==1.5.1",
+    "pandas==2.2.2",
+    "numpy==1.26.4",
+    "pymongo==4.8.0",
+    "python-dotenv==1.0.1",
+    # hnswlib compiles C++; Windows has no wheel, so use the prebuilt chroma-hnswlib (same `hnswlib` module) there
+    "hnswlib==0.8.0; sys_platform != 'win32'",
+    "chroma-hnswlib; sys_platform == 'win32'",
+]
+
+[dependency-groups]
+dev = ["pytest", "requests"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
