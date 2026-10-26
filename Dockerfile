@@ -19,6 +19,8 @@ COPY localrun.py .
 COPY vectorizer_hnsw_pipeline.py .
 COPY recommender.py .
 COPY services.py .
+# GIT_SHA (written by deploy_hf.sh) is reported by GET /version; optional
+COPY GIT_SHA* ./
 
 # Copy model artifacts
 COPY task1-tfidf_vectorizer.pkl .
