@@ -15,6 +15,7 @@ COPY task2_module.py .
 COPY task3_internship_profiles_module.py .
 COPY app.py .
 COPY ifind_log.py .
+COPY localrun.py .
 COPY vectorizer_hnsw_pipeline.py .
 COPY recommender.py .
 COPY services.py .

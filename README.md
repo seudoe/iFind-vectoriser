@@ -100,7 +100,7 @@ Employer posts must carry `name` and `summary` (the ifind schema); `status: "pub
 
 ## Files
 
-`app.py` (routes), `vectorizer_hnsw_pipeline.py` (encode, graph, move), `recommender.py` (student fan-out), `services.py` (peer URLs), `ifind_log.py` (shared log format), `env-manager.py` (pulls env from the env-manager service), `HF_DEPLOY.md` (file list for the Space).
+`app.py` (routes), `vectorizer_hnsw_pipeline.py` (encode, graph, move), `recommender.py` (student fan-out), `services.py` (peer URLs), `ifind_log.py` (shared log format), `localrun.py` (local env/port helpers, imported by app.py so it must be in the Dockerfile COPY list), `env-manager.py` (pulls env from the env-manager service), `HF_DEPLOY.md` (file list for the Space).
 
 ## Deploy
 
