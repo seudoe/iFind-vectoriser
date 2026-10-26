@@ -30,6 +30,10 @@ log = logging.getLogger("recommender")
 
 TOP_N = 20
 THRESHOLD = 0.1
+# Small nudges for the student's location (the profile "preferences" city / state): they only reorder close matches.
+CITY_BOOST = 0.08
+STATE_BOOST = 0.04
+REMOTE_BOOST = 0.03
 TFIDF_WEIGHT = 0.4
 BERT_WEIGHT = 0.6
 K = TOP_N * 2 * 2   # candidates pulled from the graph (same as the old HNSWStrategy: topN*2, doubled)
@@ -51,12 +55,35 @@ def _visible_platform_filter() -> Dict[str, Any]:
     }
 
 
+def _norm(v) -> str:
+    return str(v or "").strip().lower()
+
+
+def location_boost(location: Optional[Dict[str, Any]], is_remote: bool, addresses: Optional[list]) -> float:
+    """Boost for an internship that is remote, or in the student's city / state. 0 when the student has no location."""
+    if not location:
+        return 0.0
+    city, state = _norm(location.get("city")), _norm(location.get("state"))
+    if not city and not state:
+        return 0.0
+    boost = REMOTE_BOOST if is_remote else 0.0
+    for a in addresses or []:
+        if not isinstance(a, dict):
+            continue
+        if city and _norm(a.get("city")) == city:
+            boost = max(boost, CITY_BOOST)
+        elif state and _norm(a.get("state")) == state:
+            boost = max(boost, STATE_BOOST)
+    return boost
+
+
 class _Candidates:
     """Candidate vectors by id, kept across users in one run (the same internships come up again and again)."""
 
     def __init__(self, db):
         self.db = db
         self.cache: Dict[str, Optional[Tuple[np.ndarray, np.ndarray]]] = {}
+        self.where: Dict[str, Tuple[bool, list]] = {}   # id -> (isRemote, address[]) for the location boost
 
     def get(self, ids: Iterable[str]) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
         from bson import ObjectId
@@ -65,13 +92,14 @@ class _Candidates:
         missing = [i for i in ids if i not in self.cache]
         if missing:
             oids = [ObjectId(i) for i in missing]
-            proj = {"tfidf_vector": 1, "bert_vector": 1}
+            proj = {"tfidf_vector": 1, "bert_vector": 1, "isRemote": 1, "address": 1}
             found: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
             live = {"_id": {"$in": oids}, "$or": [{"isActive": True}, {"isActive": {"$exists": False}}]}
             plat = {**_visible_platform_filter(), "_id": {"$in": oids}}
             for col, q in ((LIVE_COLLECTION, live), (PLATFORM_COLLECTION, plat)):
                 for d in self.db[col].find(q, proj):
                     if isinstance(d.get("bert_vector"), list) and isinstance(d.get("tfidf_vector"), list):
+                        self.where[str(d["_id"])] = (bool(d.get("isRemote")), d.get("address") if isinstance(d.get("address"), list) else [])
                         found[str(d["_id"])] = (
                             np.asarray(d["tfidf_vector"], dtype=np.float32),
                             np.asarray(d["bert_vector"], dtype=np.float32),
@@ -90,7 +118,7 @@ def _brute_force_ids(db) -> List[str]:
     return ids
 
 
-def score_user(db, mgr, cands: _Candidates, tfidf: List[float], bert: List[float]) -> List[Tuple[str, float]]:
+def score_user(db, mgr, cands: _Candidates, tfidf: List[float], bert: List[float], location: Optional[Dict[str, Any]] = None) -> List[Tuple[str, float]]:
     """Run one student's vectors through the graph and return the top N (id, score), best first."""
     try:
         ids = [i for i, _ in mgr.search(bert, K)]
@@ -106,7 +134,8 @@ def score_user(db, mgr, cands: _Candidates, tfidf: List[float], bert: List[float
         b = float(u_bert @ c_bert) if c_bert.shape == u_bert.shape else 0.0
         score = t * TFIDF_WEIGHT + b * BERT_WEIGHT
         if score >= THRESHOLD:
-            scored.append((i, score))
+            remote, addresses = cands.where.get(i, (False, []))
+            scored.append((i, score + location_boost(location, remote, addresses)))
     scored.sort(key=lambda x: x[1], reverse=True)
     return scored[:TOP_N]
 
@@ -127,8 +156,11 @@ def save_recommendations(db, user_id, recs: List[Tuple[str, float]]) -> None:
 def recommend_user(user_id: str, tfidf: List[float], bert: List[float], db=None) -> int:
     """Run ONE student through the whole graph and save their list. Returns how many were recommended."""
     db = db if db is not None else get_db()
+    from bson import ObjectId
+
     mgr = get_search_manager(db, dim=len(bert))
-    recs = score_user(db, mgr, _Candidates(db), tfidf, bert)
+    location = db["users"].find_one({"_id": ObjectId(str(user_id))}, {"city": 1, "state": 1})
+    recs = score_user(db, mgr, _Candidates(db), tfidf, bert, location)
     save_recommendations(db, user_id, recs)
     return len(recs)
 
@@ -151,13 +183,13 @@ def recommend_users(user_ids: Optional[List[str]] = None, db=None) -> Dict[str, 
 
     mgr = None
     cands = _Candidates(db)
-    for user in db["users"].find(query, {"resume.tfidf_vector": 1, "resume.bert_vector": 1}):
+    for user in db["users"].find(query, {"resume.tfidf_vector": 1, "resume.bert_vector": 1, "city": 1, "state": 1}):
         stats["users"] += 1
         try:
             bert = user["resume"]["bert_vector"]
             if mgr is None:
                 mgr = get_search_manager(db, dim=len(bert))
-            recs = score_user(db, mgr, cands, user["resume"]["tfidf_vector"], bert)
+            recs = score_user(db, mgr, cands, user["resume"]["tfidf_vector"], bert, user)
             save_recommendations(db, user["_id"], recs)
             stats["updated"] += 1
         except Exception as err:
