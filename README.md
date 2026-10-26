@@ -47,9 +47,9 @@ curl -X POST .../recommend-all -H 'content-type: application/json' -d '{"backgro
 ## Run locally
 
 ```bash
-python -m venv .venv && .venv\Scripts\activate        # Python 3.11
-pip install -r requirements.txt                       # Windows installs the prebuilt chroma-hnswlib automatically (no C++ build tools)
-python app.py                                         # http://localhost:6000
+uv sync                                               # Python 3.11 venv from pyproject.toml + uv.lock (Windows gets the prebuilt chroma-hnswlib, no C++ tools)
+uv run python app.py                                  # http://localhost:6000
+uv run pytest                                         # unit tests (the API tests below need a running instance)
 ```
 
 `python app.py` prints what is running and where. If 6000 is taken it prints a red warning and uses the next free port (then
@@ -80,7 +80,7 @@ First start downloads the BERT model (about 440 MB); `/health` reports `ready: f
 ```bash
 pytest tests/test_location_boost.py                    # unit, no services
 # API + pipeline, against a scratch database (never "ifind"):
-MONGODB_DB_NAME=ifind_vectest PORT=6100 python app.py
+MONGODB_DB_NAME=ifind_vectest PORT=6100 uv run python app.py
 VECTORISER_TEST_URL=http://localhost:6100 pytest tests/test_api_integration.py -v
 ```
 
