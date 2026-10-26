@@ -202,15 +202,22 @@ class HNSWIndexManager:
         self.uid_to_id = saved.get("uid_to_id", {})
         self.id_to_uid = saved.get("id_to_uid", {})
         count = len(self.uid_to_id)
-        if current_impl == "native":
-            self.index = hnswlib.Index(space=self.space, dim=self.dim)
-            tmp = self.storage_dir / "temp_restore.bin"
-            tmp.write_bytes(blob)
-            self.index.load_index(str(tmp), max_elements=max(max_elements, count + 10000))
-            self.index.set_ef(50)
-        else:
-            self.index = FallbackHNSWIndex(space=self.space, dim=self.dim)
-            self.index.load_bytes(blob)
+        try:
+            if current_impl == "native":
+                self.index = hnswlib.Index(space=self.space, dim=self.dim)
+                tmp = self.storage_dir / "temp_restore.bin"
+                tmp.write_bytes(blob)
+                self.index.load_index(str(tmp), max_elements=max(max_elements, count + 10000))
+                self.index.set_ef(50)
+            else:
+                self.index = FallbackHNSWIndex(space=self.space, dim=self.dim)
+                self.index.load_bytes(blob)
+        except Exception as err:
+            # e.g. written by another hnswlib build (chroma-hnswlib on a Windows machine vs hnswlib on the Space)
+            log.warning("Stored graph could not be loaded (%s) — rebuilding from DB vectors", err)
+            self._reset(max_elements)
+            self.rebuild_from_db(db)
+            return
         self.loaded_updated_at = saved.get("updatedAt")
         log.info("Restored %s HNSW graph from MongoDB (%d nodes)", current_impl, count)
 
