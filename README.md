@@ -58,6 +58,36 @@ Dockerfile still starts uvicorn on 7860.
 
 First start downloads the BERT model (about 440 MB); `/health` reports `ready: false` until it is loaded.
 
+## Functions
+
+| Module | Function | What it does |
+|---|---|---|
+| `task1_module.py` | `flatten(data, mode)` | Resume JSON / internship text to one cleaned string (`parse_list_field`, `clean_text` helpers) |
+| | `tfidf_transform(data, vectorizer, mode)` | 15,000-d TF-IDF vector from the pickled vectorizer |
+| `task2_module.py` | `load_bert_model`, `bert_transform`, `bert_encode`, `bert_batch_transform` | 768-d L2-normalised `all-mpnet-base-v2` embedding (text truncated to 400 words) |
+| `task3_internship_profiles_module.py` | `boost_tfidf_vector` | Adds `boost_weight` (0.15) to every skill-cluster sibling of a skill found in the text, re-normalises |
+| | `detect_category`, `extract_skills_from_text`, `generate_internship_profile` | Category vote, skill tokens, full profile |
+| `app.py` | `_encode_text` | flatten, TF-IDF, boost, BERT: used by both encode endpoints |
+| `vectorizer_hnsw_pipeline.py` | `HNSWIndexManager` | Graph in `internships.graph` (`initialize_or_load`, `add_node`, `search`, `persist_graph`, `rebuild_from_db`); falls back to a pure-Python index when hnswlib is missing |
+| | `run_internship_vectorizer_hnsw_pipeline(ids)` | Approved staging docs: encode, add to graph, move to `internships` |
+| | `run_platform_vectorizer_pipeline(ids)` | Approved employer posts: encode from `name`/`company`/`summary`, write vectors in place, add to graph |
+| | `search_graph`, `get_search_manager` | k-NN over the persisted graph (reloads when `updatedAt` changes) |
+| `recommender.py` | `score_user` | Graph candidates, score = 0.4 TF-IDF + 0.6 BERT, threshold 0.1, plus location boost (city 0.08, state 0.04, remote 0.03), top 20 |
+| | `recommend_user`, `recommend_users`, `run_fanout` | One student / selected students / everyone; saved to `users.recommendedInternships` (`recommendedList`, `recommendedScores`) |
+
+## Tests
+
+```bash
+pytest tests/test_location_boost.py                    # unit, no services
+# API + pipeline, against a scratch database (never "ifind"):
+MONGODB_DB_NAME=ifind_vectest PORT=6100 python app.py
+VECTORISER_TEST_URL=http://localhost:6100 pytest tests/test_api_integration.py -v
+```
+
+`test_api_integration.py` covers: `/health`, `/`, `/encode-internships` (clean and raw MongoDB docs, shapes, normalisation, determinism, batch limit 70, validation), `/encode-resume` (parsed JSON, plain text, empty, with `user_id` + `recommend`), `/vectorize-hnsw` (approved moved with vectors, unapproved stays, unknown ids skipped), `/vectorize-platform`, `/search-internships`, `/recommend-all`, `/rebuild-graph`, and that a Python resume ranks Python roles first. It seeds and drops its own data.
+
+Employer posts must carry `name` and `summary` (the ifind schema); `status: "published"` is required for them to be recommended.
+
 ## Environment
 
 | Name | Purpose |
