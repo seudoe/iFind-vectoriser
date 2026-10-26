@@ -167,7 +167,6 @@ class HNSWIndexManager:
             idx = hnswlib.Index(space=self.space, dim=self.dim)
             idx.init_index(max_elements=max_elements, M=16, ef_construction=200)
             idx.set_ef(50)
-            idx.impl = "native"
         else:
             idx = FallbackHNSWIndex(space=self.space, dim=self.dim)
             idx.init_index(max_elements=max_elements, M=16, ef_construction=200)
@@ -205,7 +204,6 @@ class HNSWIndexManager:
         count = len(self.uid_to_id)
         if current_impl == "native":
             self.index = hnswlib.Index(space=self.space, dim=self.dim)
-            self.index.impl = "native"
             tmp = self.storage_dir / "temp_restore.bin"
             tmp.write_bytes(blob)
             self.index.load_index(str(tmp), max_elements=max(max_elements, count + 10000))

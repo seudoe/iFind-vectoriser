@@ -9,4 +9,7 @@ pandas==2.2.2
 numpy==1.26.4
 pymongo==4.8.0
 python-dotenv==1.0.1
-hnswlib==0.8.0
+# hnswlib compiles C++ (needs build-essential on Linux, Dockerfile installs it). Windows has no wheel for it and no compiler by
+# default, so there the prebuilt chroma-hnswlib (same `hnswlib` module) is used instead.
+hnswlib==0.8.0; sys_platform != "win32"
+chroma-hnswlib; sys_platform == "win32"

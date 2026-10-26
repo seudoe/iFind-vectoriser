@@ -48,11 +48,15 @@ curl -X POST .../recommend-all -H 'content-type: application/json' -d '{"backgro
 
 ```bash
 python -m venv .venv && .venv\Scripts\activate        # Python 3.11
-pip install -r requirements.txt
-uvicorn app:app --port 7860
+pip install -r requirements.txt                       # Windows installs the prebuilt chroma-hnswlib automatically (no C++ build tools)
+python app.py                                         # http://localhost:6000
 ```
 
-First start downloads the BERT model (about 440 MB). Startup is slow; `/health` reports `ready: false` until the models load.
+`python app.py` prints what is running and where. If 6000 is taken it prints a red warning and uses the next free port (then
+ifind and internScraper have to point at it). Local-only settings go in `.env.local` (overrides `.env`, never deployed). The
+Dockerfile still starts uvicorn on 7860.
+
+First start downloads the BERT model (about 440 MB); `/health` reports `ready: false` until it is loaded.
 
 ## Environment
 

@@ -28,6 +28,12 @@ from pydantic import BaseModel, Field, model_validator
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+from pathlib import Path
+
+from localrun import load_env
+
+load_env(Path(__file__).resolve().parent)   # .env (+ .env.local for local runs) before any module reads os.environ
+
 from services import allowed_origins
 
 from task1_module import flatten, tfidf_transform, load_vectorizer
@@ -493,3 +499,21 @@ def rebuild_graph():
     except Exception as e:
         log.error(f"Graph rebuild failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    # Local run: python app.py  (fixed port 6000; the Dockerfile starts uvicorn itself on 7860 and never gets here)
+    import uvicorn
+    from localrun import banner, pick_port
+
+    port = pick_port("vectoriser", int(os.environ.get("PORT", 6000)), "ifind and internScraper (their VECTORISER_URL)")
+    banner("vectoriser", port, {
+        "Allowed origins (CORS)": ", ".join(allowed_origins()) or None,
+        "MongoDB": "configured" if os.environ.get("MONGODB_URI") else "MONGODB_URI is NOT set",
+        "Note": "first start downloads BERT; /health says ready:false until it is loaded",
+    })
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=False, log_config=None)
