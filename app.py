@@ -397,12 +397,13 @@ class VectorizeHnswRequest(BaseModel):
     ids: Optional[List[str]] = Field(default=None, description="Restrict to these staging _ids")
     background: bool = Field(default=False, description="Return immediately and run server-side")
     recommend: bool = Field(default=True, description="After indexing, run every student through the graph (in the background)")
+    moderator_id: Optional[str] = Field(default=None, description="Moderator _id approving these internships")
 
 
-def _scraped_then_recommend(ids, recommend: bool):
+def _scraped_then_recommend(ids, recommend: bool, moderator_id: Optional[str] = None):
     from recommender import run_fanout
     from vectorizer_hnsw_pipeline import run_internship_vectorizer_hnsw_pipeline
-    stats = run_internship_vectorizer_hnsw_pipeline(ids=ids)
+    stats = run_internship_vectorizer_hnsw_pipeline(ids=ids, moderator_id=moderator_id)
     if recommend and stats.get("processed"):
         run_fanout()
     return stats
@@ -420,16 +421,16 @@ class SearchRequest(BaseModel):
 )
 def vectorize_hnsw_endpoint(req: VectorizeHnswRequest = VectorizeHnswRequest(), background_tasks: BackgroundTasks = None):
     """
-    Processes only moderation.status in (auto_approved, manually_approved).
-    Non-approved docs stay in staging untouched. Afterwards (recommend=true) every student is run through the graph.
+    Processes staged listings (or the requested ids). Each document is vectorised, approved, and moved to
+    `internships` one at a time. Afterwards (recommend=true) every student is run through the graph.
     """
     from vectorizer_hnsw_pipeline import run_internship_vectorizer_hnsw_pipeline
 
     if req.background and background_tasks is not None:
-        background_tasks.add_task(_scraped_then_recommend, req.ids, req.recommend)
+        background_tasks.add_task(_scraped_then_recommend, req.ids, req.recommend, req.moderator_id)
         return {"status": "queued"}
     try:
-        stats = run_internship_vectorizer_hnsw_pipeline(ids=req.ids)
+        stats = run_internship_vectorizer_hnsw_pipeline(ids=req.ids, moderator_id=req.moderator_id)
         if req.recommend and stats.get("processed") and background_tasks is not None:
             from recommender import run_fanout
             background_tasks.add_task(run_fanout)

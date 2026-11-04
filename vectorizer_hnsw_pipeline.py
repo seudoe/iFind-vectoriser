@@ -421,11 +421,14 @@ def run_internship_vectorizer_hnsw_pipeline(
     db_name: Optional[str] = None,
     batch_limit: Optional[int] = None,
     ids: Optional[List[str]] = None,
+    moderator_id: Optional[str] = None,
 ) -> dict:
     """
     Vectorize + index + publish approved staged internships.
 
-    ids: restrict to these staging _ids (24-hex strings). Non-approved ids are skipped, not touched.
+    ids: restrict to these staging _ids (24-hex strings). Processes each doc one at a time:
+         vectorizes, sets moderation.status to manually_approved, moves from staging to live
+         collection, and persists the graph incrementally.
     Returns {processed, errors, skipped, indexed_ids}.
     """
     from bson import ObjectId
@@ -437,7 +440,7 @@ def run_internship_vectorizer_hnsw_pipeline(
         source_col = db[STAGING_COLLECTION]
         target_col = db[LIVE_COLLECTION]
 
-        query: Dict[str, Any] = {"moderation.status": {"$in": list(APPROVED_STATUSES)}}
+        query: Dict[str, Any] = {}
         if ids is not None:
             oids = []
             for i in ids:
@@ -447,6 +450,8 @@ def run_internship_vectorizer_hnsw_pipeline(
                     stats["skipped"] += 1
             query["_id"] = {"$in": oids}
             stats["skipped"] += max(0, len(oids) - source_col.count_documents(query))
+        else:
+            query["moderation.status"] = {"$in": list(APPROVED_STATUSES)}
 
         cursor = source_col.find(query)
         if batch_limit and batch_limit > 0:
@@ -477,9 +482,22 @@ def run_internship_vectorizer_hnsw_pipeline(
                 doc["tfidf_vector"] = tfidf_vec
                 doc["bert_vector"] = bert_vec
 
+                # Set moderation status to manually_approved if not already approved
+                if "moderation" not in doc or not isinstance(doc["moderation"], dict):
+                    doc["moderation"] = {}
+                if doc["moderation"].get("status") not in APPROVED_STATUSES:
+                    doc["moderation"]["status"] = "manually_approved"
+                    doc["moderation"]["reviewedAt"] = datetime.now(timezone.utc)
+                    if moderator_id:
+                        doc["moderation"]["reviewedBy"] = moderator_id
+                    doc["moderation"]["rejectionReason"] = None
+                elif moderator_id and not doc["moderation"].get("reviewedBy"):
+                    doc["moderation"]["reviewedBy"] = moderator_id
+
                 mgr.add_node(str(doc["_id"]), np.array(bert_vec, dtype=np.float32))
                 target_col.replace_one({"_id": doc["_id"]}, doc, upsert=True)
                 source_col.delete_one({"_id": doc["_id"]})
+                mgr.persist_graph(db)
 
                 stats["processed"] += 1
                 stats["indexed_ids"].append(str(doc["_id"]))
