@@ -514,6 +514,20 @@ def search_internships(req: SearchRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/expire-internships", tags=["pipeline"], summary="Move expired scraped internships to internships.expired, drop expired ones from the graph, refresh recommendations")
+def expire_internships(background_tasks: BackgroundTasks = None):
+    try:
+        from vectorizer_hnsw_pipeline import purge_expired
+        stats = purge_expired()
+        if (stats["moved"] or stats["platform_expired"] or stats["graph_rebuilt"]) and background_tasks is not None:
+            from recommender import run_fanout
+            background_tasks.add_task(run_fanout)   # saved lists may hold ids that just expired
+        return {"status": "ok", "stats": stats}
+    except Exception as e:
+        log.error(f"Expiry sweep failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/rebuild-graph", tags=["pipeline"], summary="Rebuild the HNSW graph from live internships' stored vectors")
 def rebuild_graph():
     try:

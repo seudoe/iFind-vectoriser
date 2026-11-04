@@ -65,6 +65,27 @@ APPROVED_STATUSES = ("auto_approved", "manually_approved")
 # Serialises pipeline runs / graph persistence (single-worker uvicorn).
 PIPELINE_LOCK = threading.Lock()
 
+# Scraped internships whose application deadline has passed are moved here: out of 'internships', out of the graph.
+EXPIRED_COLLECTION = "internships.expired"
+
+
+def deadline_passed(value, now: Optional[datetime] = None) -> bool:
+    """
+    True when an application deadline is over. Scraped listings store it as a naive ISO string (UTC), employer posts as a Date.
+    A date-only value (midnight) lasts until the end of that day, the same rule as ifind lib/utils.ts deadlineState().
+    No / unreadable deadline = not expired.
+    """
+    if not value:
+        return False
+    try:
+        d = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    d = d.replace(tzinfo=timezone.utc) if d.tzinfo is None else d.astimezone(timezone.utc)
+    if d.hour == d.minute == d.second == 0:
+        d = d.replace(hour=23, minute=59, second=59)
+    return d < (now or datetime.now(timezone.utc))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Fallback index (used only when native hnswlib isn't installed)
@@ -225,12 +246,15 @@ class HNSWIndexManager:
         """Rebuild the whole graph from live internships that have a valid bert_vector."""
         self._reset()
         n = 0
+        now = datetime.now(timezone.utc)
         cursor = db[LIVE_COLLECTION].find(
             {"bert_vector": {"$type": "array"}, "isActive": {"$ne": False}},
-            {"bert_vector": 1},
+            {"bert_vector": 1, "deadlineDate": 1},
         )
         for doc in cursor:
             vec = doc["bert_vector"]
+            if deadline_passed(doc.get("deadlineDate"), now):
+                continue   # expired: never in the graph
             if len(vec) == self.dim:
                 self.add_node(str(doc["_id"]), np.array(vec, dtype=np.float32))
                 n += 1
@@ -239,9 +263,11 @@ class HNSWIndexManager:
         for doc in db[PLATFORM_COLLECTION].find(
             {"bert_vector": {"$type": "array"}, "isActive": {"$ne": False}, "bannedByCompany": {"$ne": True}, "status": {"$ne": "draft"},
              "moderation.status": {"$in": list(APPROVED_STATUSES)}},
-            {"bert_vector": 1},
+            {"bert_vector": 1, "deadlineDate": 1},
         ):
             vec = doc["bert_vector"]
+            if deadline_passed(doc.get("deadlineDate"), now):
+                continue
             if len(vec) == self.dim:
                 self.add_node(str(doc["_id"]), np.array(vec, dtype=np.float32))
                 n += 1
@@ -439,6 +465,12 @@ def run_internship_vectorizer_hnsw_pipeline(
 
         for doc in docs:
             try:
+                if deadline_passed(doc.get("deadlineDate")):
+                    # approved too late: archive instead of vectorising / publishing
+                    db[EXPIRED_COLLECTION].replace_one({"_id": doc["_id"]}, {**doc, "expiredAt": datetime.now(timezone.utc)}, upsert=True)
+                    source_col.delete_one({"_id": doc["_id"]})
+                    stats["expired"] = stats.get("expired", 0) + 1
+                    continue
                 full_text = f"{doc.get('name') or doc.get('title') or ''}. {doc.get('company') or ''}. " \
                             f"{doc.get('summary') or doc.get('description') or ''}".strip()
                 tfidf_vec, bert_vec = encode_internship_text(full_text, tfidf_model, bert_model, clusters, s2c)
@@ -524,6 +556,50 @@ def run_platform_vectorizer_pipeline(
 
     log.info("Platform vectorizer done — processed=%d errors=%d skipped=%d",
              stats["processed"], stats["errors"], stats["skipped"])
+    return stats
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Expiry sweep
+# ─────────────────────────────────────────────────────────────────────────────
+
+def purge_expired(db=None) -> Dict[str, Any]:
+    """
+    Remove expired internships from everything the recommender can see.
+      scraped ('internships'):           moved to 'internships.expired' (kept for applied / saved history)
+      employer-posted (this-platform):   stay where they are (the employer owns them), only dropped from the graph
+    The graph is rebuilt (without expired nodes) when it held any of them. Idempotent; safe to call often.
+    """
+    db = db if db is not None else get_db()
+    now = datetime.now(timezone.utc)
+    stats: Dict[str, Any] = {"moved": 0, "platform_expired": 0, "graph_rebuilt": False}
+    with PIPELINE_LOCK:
+        gone: List[str] = []
+        for d in db[LIVE_COLLECTION].find({"deadlineDate": {"$ne": None}}, {"deadlineDate": 1}):
+            if deadline_passed(d.get("deadlineDate"), now):
+                full = db[LIVE_COLLECTION].find_one({"_id": d["_id"]})
+                if full is None:
+                    continue
+                full.pop("tfidf_vector", None)
+                full.pop("bert_vector", None)   # vectors are useless once it can no longer be recommended
+                db[EXPIRED_COLLECTION].replace_one({"_id": d["_id"]}, {**full, "expiredAt": now}, upsert=True)
+                db[LIVE_COLLECTION].delete_one({"_id": d["_id"]})
+                gone.append(str(d["_id"]))
+        stats["moved"] = len(gone)
+        for d in db[PLATFORM_COLLECTION].find({"deadlineDate": {"$ne": None}}, {"deadlineDate": 1}):
+            if deadline_passed(d.get("deadlineDate"), now):
+                gone.append(str(d["_id"]))
+                stats["platform_expired"] += 1
+        mgr = HNSWIndexManager()
+        mgr.initialize_or_load(db)
+        # also catches nodes of listings another service (internScraper) already moved to the expired collection
+        from bson import ObjectId
+        oids = [ObjectId(u) for u in mgr.uid_to_id if ObjectId.is_valid(u)]
+        gone += [str(d["_id"]) for d in db[EXPIRED_COLLECTION].find({"_id": {"$in": oids}}, {"_id": 1})] if oids else []
+        if any(i in mgr.uid_to_id for i in gone):
+            mgr.rebuild_from_db(db)
+            stats["graph_rebuilt"] = True
+    log.info("Expiry sweep: %s", stats)
     return stats
 
 

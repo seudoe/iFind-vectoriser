@@ -23,7 +23,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 
 from vectorizer_hnsw_pipeline import (
-    APPROVED_STATUSES, LIVE_COLLECTION, PLATFORM_COLLECTION, get_db, get_search_manager,
+    APPROVED_STATUSES, LIVE_COLLECTION, PLATFORM_COLLECTION, deadline_passed, get_db, get_search_manager, purge_expired,
 )
 
 log = logging.getLogger("recommender")
@@ -92,12 +92,15 @@ class _Candidates:
         missing = [i for i in ids if i not in self.cache]
         if missing:
             oids = [ObjectId(i) for i in missing]
-            proj = {"tfidf_vector": 1, "bert_vector": 1, "isRemote": 1, "address": 1}
+            proj = {"tfidf_vector": 1, "bert_vector": 1, "isRemote": 1, "address": 1, "deadlineDate": 1}
+            now = datetime.now(timezone.utc)
             found: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
             live = {"_id": {"$in": oids}, "$or": [{"isActive": True}, {"isActive": {"$exists": False}}]}
             plat = {**_visible_platform_filter(), "_id": {"$in": oids}}
             for col, q in ((LIVE_COLLECTION, live), (PLATFORM_COLLECTION, plat)):
                 for d in self.db[col].find(q, proj):
+                    if deadline_passed(d.get("deadlineDate"), now):
+                        continue   # expired: never recommended, whatever the graph still holds
                     if isinstance(d.get("bert_vector"), list) and isinstance(d.get("tfidf_vector"), list):
                         self.where[str(d["_id"])] = (bool(d.get("isRemote")), d.get("address") if isinstance(d.get("address"), list) else [])
                         found[str(d["_id"])] = (
@@ -112,9 +115,11 @@ class _Candidates:
 def _brute_force_ids(db) -> List[str]:
     """Graph unavailable: every recommendable internship (the old BruteForceStrategy). ponytail: O(n), fine as a fallback."""
     ids = [str(d["_id"]) for d in db[LIVE_COLLECTION].find(
-        {"$or": [{"isActive": True}, {"isActive": {"$exists": False}}], "bert_vector": {"$type": "array"}}, {"_id": 1})]
+        {"$or": [{"isActive": True}, {"isActive": {"$exists": False}}], "bert_vector": {"$type": "array"}}, {"_id": 1, "deadlineDate": 1})
+        if not deadline_passed(d.get("deadlineDate"))]
     ids += [str(d["_id"]) for d in db[PLATFORM_COLLECTION].find(
-        {**_visible_platform_filter(), "bert_vector": {"$type": "array"}}, {"_id": 1})]
+        {**_visible_platform_filter(), "bert_vector": {"$type": "array"}}, {"_id": 1, "deadlineDate": 1})
+        if not deadline_passed(d.get("deadlineDate"))]
     return ids
 
 
@@ -206,6 +211,10 @@ def run_fanout(user_ids: Optional[List[str]] = None) -> Dict[str, Any]:
     A targeted run (user_ids) is never coalesced.
     """
     global _fanout_dirty
+    try:
+        purge_expired()   # expired internships leave the collection and the graph before anyone is scored
+    except Exception as err:
+        log.error("Expiry sweep failed (the recommender still skips expired internships): %s", err)
     if user_ids is not None:
         return recommend_users(user_ids)
     if not _FANOUT_LOCK.acquire(blocking=False):
