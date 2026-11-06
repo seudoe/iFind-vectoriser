@@ -93,7 +93,7 @@ class Formatter(logging.Formatter):
         label, code = _LEVELS.get(record.levelno, (record.levelname[:5].ljust(5), "1"))
         sep = _p("2", "│", on)
         t = datetime.fromtimestamp(record.created)
-        stamp = t.strftime("%H:%M:%S.") + f"{t.microsecond // 1000:03d}"
+        stamp = f"{t.day}/{t.month}/{t.year}-{t.strftime('%H:%M:%S')}"
         scope = "uvicorn" if record.name.startswith("uvicorn") else record.name
         msg = record.getMessage()
         if record.levelno >= logging.ERROR:
