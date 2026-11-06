@@ -453,7 +453,7 @@ class SearchRequest(BaseModel):
     tags=["pipeline"],
     summary="Vectorise APPROVED internships.mod-unvectorised docs, insert into HNSW graph, move to internships",
 )
-def vectorize_hnsw_endpoint(req: VectorizeHnswRequest = VectorizeHnswRequest(), background_tasks: BackgroundTasks = None):
+def vectorize_hnsw_endpoint(background_tasks: BackgroundTasks, req: VectorizeHnswRequest = VectorizeHnswRequest()):
     """
     Processes staged listings (or the requested ids). Each document is vectorised, approved, and moved to
     `internships` one at a time. Afterwards (recommend=true) every student is run through the graph.
@@ -508,7 +508,7 @@ def _platform_then_recommend(ids, recommend: bool):
     tags=["pipeline"],
     summary="Vectorise APPROVED employer-posted internships in place (internships.this-platform)",
 )
-def vectorize_platform_endpoint(req: VectorizePlatformRequest, background_tasks: BackgroundTasks = None):
+def vectorize_platform_endpoint(background_tasks: BackgroundTasks, req: VectorizePlatformRequest):
     """
     ifind-source internships are not staged or moved: vectors are written onto the document where it lives and
     its id is added to the HNSW graph. Only moderation.status in (auto_approved, manually_approved) is processed.
@@ -549,7 +549,7 @@ class RecommendAllRequest(BaseModel):
     tags=["pipeline"],
     summary="Run every student (or user_ids) through the whole HNSW graph and save their recommendations",
 )
-def recommend_all(req: RecommendAllRequest = RecommendAllRequest(), background_tasks: BackgroundTasks = None):
+def recommend_all(background_tasks: BackgroundTasks, req: RecommendAllRequest = RecommendAllRequest()):
     from recommender import run_fanout
 
     target_desc = f"{len(req.user_ids)} specified students" if req.user_ids else "every student with active resume"
