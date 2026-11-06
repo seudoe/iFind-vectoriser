@@ -164,9 +164,16 @@ def recommend_user(user_id: str, tfidf: List[float], bert: List[float], db=None)
     from bson import ObjectId
 
     mgr = get_search_manager(db, dim=len(bert))
-    location = db["users"].find_one({"_id": ObjectId(str(user_id))}, {"city": 1, "state": 1})
-    recs = score_user(db, mgr, _Candidates(db), tfidf, bert, location)
+    graph_count = mgr.index.get_current_count() if mgr and mgr.index else len(mgr.uid_to_id)
+    user_doc = db["users"].find_one({"_id": ObjectId(str(user_id))}, {"username": 1, "email": 1, "name": 1, "city": 1, "state": 1})
+    username = user_doc.get("username") or user_doc.get("email") or user_doc.get("name") or str(user_id) if user_doc else str(user_id)
+
+    log.info("Running recommender for student '%s' (id=%s) against %d graph internships...",
+             username, user_id, graph_count)
+    recs = score_user(db, mgr, _Candidates(db), tfidf, bert, user_doc)
     save_recommendations(db, user_id, recs)
+    top_score = round(recs[0][1], 3) if recs else 0.0
+    log.ok("Recommended %d internships for student '%s' (top match: %.3f)", len(recs), username, top_score)
     return len(recs)
 
 
@@ -186,21 +193,50 @@ def recommend_users(user_ids: Optional[List[str]] = None, db=None) -> Dict[str, 
                 stats["errors"] += 1
         query["_id"] = {"$in": oids}
 
-    mgr = None
+    mgr = get_search_manager(db)
+    graph_count = mgr.index.get_current_count() if mgr and mgr.index else (len(mgr.uid_to_id) if mgr else 0)
+    total_users = db["users"].count_documents(query)
+
+    target_desc = f"{total_users} specified student(s)" if user_ids is not None else f"every student ({total_users} with active resumes)"
+    log.info("Running recommender fan-out on %s against %d graph internships (top %d per student)...",
+             target_desc, graph_count, TOP_N)
+
+    if total_users == 0:
+        log.info("No matching students found in database — 0 recommendations needed")
+        return stats
+
     cands = _Candidates(db)
-    for user in db["users"].find(query, {"resume.tfidf_vector": 1, "resume.bert_vector": 1, "city": 1, "state": 1}):
+    cursor = db["users"].find(
+        query,
+        {"username": 1, "email": 1, "name": 1, "resume.tfidf_vector": 1, "resume.bert_vector": 1, "city": 1, "state": 1}
+    )
+
+    idx = 0
+    for user in cursor:
+        idx += 1
         stats["users"] += 1
+        username = user.get("username") or user.get("email") or user.get("name") or str(user["_id"])
         try:
             bert = user["resume"]["bert_vector"]
-            if mgr is None:
+            if mgr is None or mgr.dim != len(bert):
                 mgr = get_search_manager(db, dim=len(bert))
             recs = score_user(db, mgr, cands, user["resume"]["tfidf_vector"], bert, user)
             save_recommendations(db, user["_id"], recs)
             stats["updated"] += 1
+            top_score = round(recs[0][1], 3) if recs else 0.0
+            log.info("[%d/%d] Recommended for student '%s': %d internships matched (top score: %.3f)",
+                     idx, total_users, username, len(recs), top_score)
         except Exception as err:
-            log.error("Recommendation failed for user %s: %s", user.get("_id"), err)
+            log.error("[%d/%d] Recommendation failed for student '%s' (id=%s): %s",
+                      idx, total_users, username, user.get("_id"), err)
             stats["errors"] += 1
-    log.info("Recommended for %s", stats)
+
+    if stats["errors"] == 0:
+        log.ok("Recommender complete: %d/%d students updated successfully, 0 failed (graph size: %d internships)",
+               stats["updated"], stats["users"], graph_count)
+    else:
+        log.warn("Recommender finished with issues: %d updated, %d failed out of %d students",
+                 stats["updated"], stats["errors"], stats["users"])
     return stats
 
 
@@ -219,12 +255,17 @@ def run_fanout(user_ids: Optional[List[str]] = None) -> Dict[str, Any]:
         return recommend_users(user_ids)
     if not _FANOUT_LOCK.acquire(blocking=False):
         _fanout_dirty = True
+        log.info("Recommender fan-out already in progress — marked dirty to re-run on completion")
         return {"status": "coalesced"}
     try:
+        pass_count = 1
         while True:
             _fanout_dirty = False
+            log.info("Starting recommender fan-out pass #%d on all students...", pass_count)
             stats = recommend_users()
             if not _fanout_dirty:
                 return stats
+            pass_count += 1
+            log.info("Fan-out marked dirty during pass #%d, running subsequent pass...", pass_count - 1)
     finally:
         _FANOUT_LOCK.release()

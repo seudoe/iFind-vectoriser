@@ -144,6 +144,12 @@ class RequestLogMiddleware:
             return await self.app(scope, receive, send)
         started = time.perf_counter()
         info = {"status": 500, "bytes": 0}
+        path = scope.get("path", "")
+        method = scope.get("method", "GET")
+        client = (scope.get("client") or ("-",))[0]
+
+        if path not in self.QUIET:
+            self.log.info("--> %s %s", method, path, extra={"f": {"client": client}})
 
         async def _send(message):
             if message["type"] == "http.response.start":
@@ -157,9 +163,8 @@ class RequestLogMiddleware:
         finally:
             ms = round((time.perf_counter() - started) * 1000)
             st = info["status"]
-            lvl = logging.ERROR if st >= 500 else logging.WARNING if st >= 400 else (logging.DEBUG if scope["path"] in self.QUIET else logging.INFO)
-            client = (scope.get("client") or ("-",))[0]
-            self.log.log(lvl, "request", extra={"f": {"method": scope["method"], "path": scope["path"], "status": st, "ms": ms, "bytes": info["bytes"], "client": client}})
+            lvl = logging.ERROR if st >= 500 else logging.WARNING if st >= 400 else (logging.DEBUG if path in self.QUIET else logging.INFO)
+            self.log.log(lvl, "<-- %s %s", method, path, extra={"f": {"status": st, "ms": ms, "bytes": info["bytes"], "client": client}})
 
 
 def capture_print(default_scope: str = "print") -> None:

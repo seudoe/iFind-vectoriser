@@ -458,26 +458,30 @@ def run_internship_vectorizer_hnsw_pipeline(
             cursor = cursor.limit(batch_limit)
         docs = list(cursor)
         if not docs:
-            log.info("No approved internships waiting in '%s'.", STAGING_COLLECTION)
+            log.info("Staging check: 0 approved internships waiting in '%s' (nothing to vectorise)", STAGING_COLLECTION)
             return stats
 
-        log.info("Found %d approved internship(s) to vectorize.", len(docs))
+        log.info("Found %d approved staged internship(s) to vectorise and index into HNSW graph", len(docs))
         tfidf_model, bert_model, clusters, s2c = load_recommender_models()
         dim = getattr(bert_model, "get_sentence_embedding_dimension", lambda: 768)()
 
         mgr = HNSWIndexManager(dim=dim, space='cosine')
         mgr.initialize_or_load(db)
 
-        for doc in docs:
+        for idx, doc in enumerate(docs, start=1):
+            title = doc.get("name") or doc.get("title") or "Untitled"
+            company = doc.get("company") or "Unknown"
+            doc_id = str(doc.get("_id"))
             try:
                 if deadline_passed(doc.get("deadlineDate")):
                     # approved too late: archive instead of vectorising / publishing
+                    log.warn("[%d/%d] Archiving expired internship '%s' at '%s' (id=%s, deadline was %s)",
+                             idx, len(docs), title, company, doc_id, doc.get("deadlineDate"))
                     db[EXPIRED_COLLECTION].replace_one({"_id": doc["_id"]}, {**doc, "expiredAt": datetime.now(timezone.utc)}, upsert=True)
                     source_col.delete_one({"_id": doc["_id"]})
                     stats["expired"] = stats.get("expired", 0) + 1
                     continue
-                full_text = f"{doc.get('name') or doc.get('title') or ''}. {doc.get('company') or ''}. " \
-                            f"{doc.get('summary') or doc.get('description') or ''}".strip()
+                full_text = f"{title}. {company}. {doc.get('summary') or doc.get('description') or ''}".strip()
                 tfidf_vec, bert_vec = encode_internship_text(full_text, tfidf_model, bert_model, clusters, s2c)
                 doc["tfidf_vector"] = tfidf_vec
                 doc["bert_vector"] = bert_vec
@@ -494,22 +498,28 @@ def run_internship_vectorizer_hnsw_pipeline(
                 elif moderator_id and not doc["moderation"].get("reviewedBy"):
                     doc["moderation"]["reviewedBy"] = moderator_id
 
-                mgr.add_node(str(doc["_id"]), np.array(bert_vec, dtype=np.float32))
+                mgr.add_node(doc_id, np.array(bert_vec, dtype=np.float32))
                 target_col.replace_one({"_id": doc["_id"]}, doc, upsert=True)
                 source_col.delete_one({"_id": doc["_id"]})
                 mgr.persist_graph(db)
 
                 stats["processed"] += 1
-                stats["indexed_ids"].append(str(doc["_id"]))
+                stats["indexed_ids"].append(doc_id)
+                log.info("[%d/%d] Vectorised & published: '%s' at '%s' (id=%s)",
+                         idx, len(docs), title, company, doc_id)
             except Exception as err:
-                log.error("Error processing %s: %s", doc.get("_id"), err)
+                log.error("[%d/%d] Error vectorising '%s' (id=%s): %s", idx, len(docs), title, doc_id, err)
                 stats["errors"] += 1
 
         if stats["processed"]:
             mgr.persist_graph(db)
 
-    log.info("Pipeline done — processed=%d errors=%d skipped=%d",
-             stats["processed"], stats["errors"], stats["skipped"])
+    if stats["errors"] == 0:
+        log.ok("Staged vectorisation complete: %d/%d vectorised & moved to live (skipped=%d, expired=%d, graph now %d nodes)",
+               stats["processed"], len(docs), stats["skipped"], stats.get("expired", 0), len(mgr.uid_to_id))
+    else:
+        log.warn("Staged vectorisation finished with errors: %d vectorised, %d failed out of %d internships (skipped=%d, expired=%d, graph now %d nodes)",
+                 stats["processed"], stats["errors"], len(docs), stats["skipped"], stats.get("expired", 0), len(mgr.uid_to_id))
     return stats
 
 
@@ -539,6 +549,7 @@ def run_platform_vectorizer_pipeline(
         except Exception:
             stats["skipped"] += 1
     if not oids:
+        log.info("Platform vectoriser: 0 valid IDs provided, nothing to process")
         return stats
 
     with PIPELINE_LOCK:
@@ -547,33 +558,47 @@ def run_platform_vectorizer_pipeline(
         docs = list(col.find({"_id": {"$in": oids}, "bannedByCompany": {"$ne": True}, "moderation.status": {"$in": list(APPROVED_STATUSES)}}))
         stats["skipped"] += len(oids) - len(docs)
         if not docs:
+            log.info("Platform vectoriser: none of the %d provided IDs are approved employer internships in '%s'",
+                     len(oids), PLATFORM_COLLECTION)
             return stats
 
+        log.info("Found %d approved employer internship(s) in '%s' to vectorise in place",
+                 len(docs), PLATFORM_COLLECTION)
         tfidf_model, bert_model, clusters, s2c = load_recommender_models()
         dim = getattr(bert_model, "get_sentence_embedding_dimension", lambda: 768)()
         mgr = HNSWIndexManager(dim=dim, space='cosine')
         mgr.initialize_or_load(db)
 
-        for doc in docs:
+        for idx, doc in enumerate(docs, start=1):
+            title = doc.get("name") or "Untitled"
+            company = doc.get("company") or "Unknown"
+            doc_id = str(doc.get("_id"))
             try:
-                text = f"{doc.get('name') or ''}. {doc.get('company') or ''}. {doc.get('summary') or ''}".strip()
+                text = f"{title}. {company}. {doc.get('summary') or ''}".strip()
                 tfidf_vec, bert_vec = encode_internship_text(text, tfidf_model, bert_model, clusters, s2c)
                 col.update_one(
                     {"_id": doc["_id"]},
                     {"$set": {"tfidf_vector": tfidf_vec, "bert_vector": bert_vec, "vectorizedAt": datetime.now(timezone.utc)}},
                 )
-                mgr.add_node(str(doc["_id"]), np.array(bert_vec, dtype=np.float32))
+                mgr.add_node(doc_id, np.array(bert_vec, dtype=np.float32))
                 stats["processed"] += 1
-                stats["vectorized_ids"].append(str(doc["_id"]))
+                stats["vectorized_ids"].append(doc_id)
+                log.info("[%d/%d] Vectorised employer internship: '%s' at '%s' (id=%s)",
+                         idx, len(docs), title, company, doc_id)
             except Exception as err:
-                log.error("Error vectorizing platform internship %s: %s", doc.get("_id"), err)
+                log.error("[%d/%d] Error vectorising platform internship '%s' (id=%s): %s",
+                          idx, len(docs), title, doc_id, err)
                 stats["errors"] += 1
 
         if stats["processed"]:
             mgr.persist_graph(db)
 
-    log.info("Platform vectorizer done — processed=%d errors=%d skipped=%d",
-             stats["processed"], stats["errors"], stats["skipped"])
+    if stats["errors"] == 0:
+        log.ok("Platform vectorisation complete: %d/%d vectorised in place (skipped=%d, graph now %d nodes)",
+               stats["processed"], len(docs), stats["skipped"], len(mgr.uid_to_id))
+    else:
+        log.warn("Platform vectorisation finished with errors: %d vectorised, %d failed out of %d internships (skipped=%d)",
+                 stats["processed"], stats["errors"], len(docs), stats["skipped"])
     return stats
 
 

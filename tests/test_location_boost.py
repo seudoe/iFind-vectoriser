@@ -1,11 +1,13 @@
 import sys
 import types
 
-# recommender imports the HNSW pipeline (torch, hnswlib, Mongo); the boost is a pure function, so stub that import
-_stub = types.ModuleType("vectorizer_hnsw_pipeline")
-for _n in ("APPROVED_STATUSES", "LIVE_COLLECTION", "PLATFORM_COLLECTION", "get_db", "get_search_manager"):
-    setattr(_stub, _n, None)
-sys.modules.setdefault("vectorizer_hnsw_pipeline", _stub)
+try:
+    import vectorizer_hnsw_pipeline
+except Exception:
+    _stub = types.ModuleType("vectorizer_hnsw_pipeline")
+    for _n in ("APPROVED_STATUSES", "LIVE_COLLECTION", "PLATFORM_COLLECTION", "get_db", "get_search_manager", "deadline_passed", "purge_expired"):
+        setattr(_stub, _n, None)
+    sys.modules.setdefault("vectorizer_hnsw_pipeline", _stub)
 
 from recommender import CITY_BOOST, REMOTE_BOOST, STATE_BOOST, location_boost
 

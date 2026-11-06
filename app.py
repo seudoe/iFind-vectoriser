@@ -309,29 +309,41 @@ def encode_internships(req: EncodeInternshipsRequest):
     """
     _check_ready()
 
-    if len(req.internships) > MAX_BATCH:
+    total = len(req.internships)
+    log.info("Running vectoriser on %d internships (batch encode, boost=%.2f)...", total, req.boost_weight)
+
+    if total > MAX_BATCH:
+        log.warn("Batch rejected: %d exceeds maximum batch size %d", total, MAX_BATCH)
         raise HTTPException(
             status_code = 422,
-            detail      = f"Batch too large: {len(req.internships)} > max {MAX_BATCH}. Split into smaller batches.",
+            detail      = f"Batch too large: {total} > max {MAX_BATCH}. Split into smaller batches.",
         )
 
     results: List[InternshipVectors] = []
+    errors: List[str] = []
 
-    for item in req.internships:
+    for idx, item in enumerate(req.internships, start=1):
         # Combine title + description for richer signal
         full_text = f"{item.resolved_title()}. {item.resolved_description()}"
+        item_id = item.resolved_id()
+        title = item.resolved_title()
         try:
             vecs = _encode_text(full_text, boost=req.boost_weight)
             results.append(InternshipVectors(
-                id    = item.resolved_id(),
+                id    = item_id,
                 tfidf = vecs["tfidf"],
                 bert  = vecs["bert"],
             ))
         except Exception as e:
-            log.error(f"Failed to encode internship {item.resolved_id()}: {e}")
-            raise HTTPException(status_code=500, detail=f"Encoding failed for id={item.resolved_id()}: {e}")
+            log.error("[%d/%d] Failed to vectorise internship '%s' (id=%s): %s", idx, total, title, item_id, e)
+            errors.append(f"{item_id}: {e}")
 
-    log.info("internships encoded", extra={"f": {"count": len(results)}})
+    if errors:
+        log.warn("Batch vectorisation finished with errors: %d vectorised, %d failed out of %d internships",
+                 len(results), len(errors), total)
+        raise HTTPException(status_code=500, detail=f"Encoding failed for {len(errors)} items: {'; '.join(errors[:3])}")
+
+    log.ok("Batch vectorisation complete: %d/%d internships vectorised successfully", len(results), total)
     return EncodeInternshipsResponse(encoded=len(results), vectors=results)
 
 
@@ -358,6 +370,21 @@ def encode_resume(req: EncodeResumeRequest):
     """
     _check_ready()
 
+    username = None
+    if req.user_id:
+        try:
+            from bson import ObjectId
+            from vectorizer_hnsw_pipeline import get_db
+            db = get_db()
+            u = db["users"].find_one({"_id": ObjectId(req.user_id)}, {"username": 1, "email": 1, "name": 1})
+            if u:
+                username = u.get("username") or u.get("email") or u.get("name")
+        except Exception:
+            pass
+
+    user_label = f"student '{username}' (id={req.user_id})" if username else (f"user_id={req.user_id}" if req.user_id else "unlinked resume")
+    log.info("Running vectoriser on resume for %s [recommend=%s]", user_label, req.recommend)
+
     # If resume is a dict (parsed JSON), flatten it to text first
     if isinstance(req.resume, dict):
         resume_text = flatten(req.resume, mode="json")
@@ -365,15 +392,16 @@ def encode_resume(req: EncodeResumeRequest):
         resume_text = str(req.resume)
 
     if not resume_text.strip():
+        log.warn("Resume vectorisation aborted: empty text for %s", user_label)
         raise HTTPException(status_code=422, detail="Resume text is empty after flattening")
 
     try:
         vecs = _encode_text(resume_text, boost=req.boost_weight)
     except Exception as e:
-        log.error(f"Resume encoding failed: {e}")
+        log.error("Resume vectorisation failed for %s: %s", user_label, e)
         raise HTTPException(status_code=500, detail=str(e))
 
-    log.ok("resume encoded")
+    log.ok("Vectorised resume for %s: generated tfidf (15000-d) and bert (768-d)", user_label)
     recommended = None
     if req.user_id:
         try:
@@ -384,11 +412,13 @@ def encode_resume(req: EncodeResumeRequest):
                 {"_id": ObjectId(req.user_id)},
                 {"$set": {"resume.tfidf_vector": vecs["tfidf"], "resume.bert_vector": vecs["bert"]}},
             )
+            log.info("Saved resume vectors for %s to MongoDB", user_label)
             if req.recommend:
                 from recommender import recommend_user
                 recommended = recommend_user(req.user_id, vecs["tfidf"], vecs["bert"], db)
+                log.ok("Recommender complete for %s: %d recommendations generated", user_label, recommended)
         except Exception as e:
-            log.error(f"Saving resume vectors / recommending failed: {e}")
+            log.error("Saving resume vectors / recommending failed for %s: %s", user_label, e)
             raise HTTPException(status_code=500, detail=str(e))
     return EncodeResumeResponse(tfidf=vecs["tfidf"], bert=vecs["bert"], recommended=recommended)
 
@@ -403,8 +433,12 @@ class VectorizeHnswRequest(BaseModel):
 def _scraped_then_recommend(ids, recommend: bool, moderator_id: Optional[str] = None):
     from recommender import run_fanout
     from vectorizer_hnsw_pipeline import run_internship_vectorizer_hnsw_pipeline
+    log.info("Background task: starting staged vectorisation [target_ids=%s, recommend=%s]",
+             f"{len(ids)} IDs" if ids else "all approved", recommend)
     stats = run_internship_vectorizer_hnsw_pipeline(ids=ids, moderator_id=moderator_id)
     if recommend and stats.get("processed"):
+        log.info("Staged vectorisation processed %d new internships — triggering student recommender fan-out...",
+                 stats.get("processed", 0))
         run_fanout()
     return stats
 
@@ -426,17 +460,27 @@ def vectorize_hnsw_endpoint(req: VectorizeHnswRequest = VectorizeHnswRequest(), 
     """
     from vectorizer_hnsw_pipeline import run_internship_vectorizer_hnsw_pipeline
 
+    ids_desc = f"{len(req.ids)} specific IDs" if req.ids else "all approved staged"
+    log.info("API POST /vectorize-hnsw: vectorise %s internships [recommend=%s, background=%s]",
+             ids_desc, req.recommend, req.background)
+
     if req.background and background_tasks is not None:
         background_tasks.add_task(_scraped_then_recommend, req.ids, req.recommend, req.moderator_id)
         return {"status": "queued"}
     try:
         stats = run_internship_vectorizer_hnsw_pipeline(ids=req.ids, moderator_id=req.moderator_id)
-        if req.recommend and stats.get("processed") and background_tasks is not None:
-            from recommender import run_fanout
-            background_tasks.add_task(run_fanout)
+        if req.recommend and stats.get("processed"):
+            log.info("Staged vectorisation processed %d new internships — triggering student recommender fan-out...",
+                     stats.get("processed", 0))
+            if background_tasks is not None:
+                from recommender import run_fanout
+                background_tasks.add_task(run_fanout)
+            else:
+                from recommender import run_fanout
+                run_fanout()
         return {"status": "ok", "stats": stats}
     except Exception as e:
-        log.error(f"HNSW Vectorizer Pipeline failed: {e}")
+        log.error("HNSW Vectorizer Pipeline failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -449,8 +493,12 @@ class VectorizePlatformRequest(BaseModel):
 def _platform_then_recommend(ids, recommend: bool):
     from recommender import run_fanout
     from vectorizer_hnsw_pipeline import run_platform_vectorizer_pipeline
+    log.info("Background task: starting platform vectorisation on %d employer internship(s) [recommend=%s]",
+             len(ids), recommend)
     stats = run_platform_vectorizer_pipeline(ids=ids)
     if recommend and stats.get("processed"):
+        log.info("Platform vectorisation processed %d internships — triggering student recommender fan-out...",
+                 stats.get("processed", 0))
         run_fanout()
     return stats
 
@@ -468,17 +516,26 @@ def vectorize_platform_endpoint(req: VectorizePlatformRequest, background_tasks:
     """
     from vectorizer_hnsw_pipeline import run_platform_vectorizer_pipeline
 
+    log.info("API POST /vectorize-platform: vectorise %d employer internships in place [recommend=%s, background=%s]",
+             len(req.ids), req.recommend, req.background)
+
     if req.background and background_tasks is not None:
         background_tasks.add_task(_platform_then_recommend, req.ids, req.recommend)
         return {"status": "queued"}
     try:
         stats = run_platform_vectorizer_pipeline(ids=req.ids)
-        if req.recommend and stats.get("processed") and background_tasks is not None:
-            from recommender import run_fanout
-            background_tasks.add_task(run_fanout)
+        if req.recommend and stats.get("processed"):
+            log.info("Platform vectorisation processed %d internships — triggering student recommender fan-out...",
+                     stats.get("processed", 0))
+            if background_tasks is not None:
+                from recommender import run_fanout
+                background_tasks.add_task(run_fanout)
+            else:
+                from recommender import run_fanout
+                run_fanout()
         return {"status": "ok", "stats": stats}
     except Exception as e:
-        log.error(f"Platform vectorizer failed: {e}")
+        log.error("Platform vectorizer failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -495,13 +552,18 @@ class RecommendAllRequest(BaseModel):
 def recommend_all(req: RecommendAllRequest = RecommendAllRequest(), background_tasks: BackgroundTasks = None):
     from recommender import run_fanout
 
+    target_desc = f"{len(req.user_ids)} specified students" if req.user_ids else "every student with active resume"
+    log.info("API POST /recommend-all: triggered recommendation fan-out for %s [background=%s]",
+             target_desc, req.background)
+
     if req.background and background_tasks is not None:
         background_tasks.add_task(run_fanout, req.user_ids)
         return {"status": "queued"}
     try:
-        return {"status": "ok", "stats": run_fanout(req.user_ids)}
+        stats = run_fanout(req.user_ids)
+        return {"status": "ok", "stats": stats}
     except Exception as e:
-        log.error(f"Recommend-all failed: {e}")
+        log.error("Recommend-all failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -509,9 +571,13 @@ def recommend_all(req: RecommendAllRequest = RecommendAllRequest(), background_t
 def search_internships(req: SearchRequest):
     try:
         from vectorizer_hnsw_pipeline import search_graph
-        return {"results": [{"id": i, "score": sc} for i, sc in search_graph(req.vector, req.k)]}
+        log.info("API POST /search-internships: k-NN query (k=%d, dim=%d)", req.k, len(req.vector))
+        results = search_graph(req.vector, req.k)
+        log.ok("Search returned %d nearest internships (top similarity: %.3f)",
+               len(results), results[0][1] if results else 0.0)
+        return {"results": [{"id": i, "score": sc} for i, sc in results]}
     except Exception as e:
-        log.error(f"Graph search failed: {e}")
+        log.error("Graph search failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -519,13 +585,17 @@ def search_internships(req: SearchRequest):
 def expire_internships(background_tasks: BackgroundTasks = None):
     try:
         from vectorizer_hnsw_pipeline import purge_expired
+        log.info("API POST /expire-internships: starting deadline expiry sweep...")
         stats = purge_expired()
+        log.ok("Expiry sweep complete: %d scraped moved, %d platform expired, graph rebuilt: %s",
+               stats.get("moved", 0), stats.get("platform_expired", 0), stats.get("graph_rebuilt", False))
         if (stats["moved"] or stats["platform_expired"] or stats["graph_rebuilt"]) and background_tasks is not None:
             from recommender import run_fanout
+            log.info("Internships expired from graph — scheduling recommender fan-out in background")
             background_tasks.add_task(run_fanout)   # saved lists may hold ids that just expired
         return {"status": "ok", "stats": stats}
     except Exception as e:
-        log.error(f"Expiry sweep failed: {e}")
+        log.error("Expiry sweep failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -533,12 +603,14 @@ def expire_internships(background_tasks: BackgroundTasks = None):
 def rebuild_graph():
     try:
         from vectorizer_hnsw_pipeline import HNSWIndexManager, PIPELINE_LOCK, get_db
+        log.info("API POST /rebuild-graph: rebuilding HNSW graph from MongoDB...")
         with PIPELINE_LOCK:
             db = get_db()
             n = HNSWIndexManager().rebuild_from_db(db)
+        log.ok("Graph rebuilt: indexed %d live internship vectors", n)
         return {"status": "ok", "indexed": n}
     except Exception as e:
-        log.error(f"Graph rebuild failed: {e}")
+        log.error("Graph rebuild failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
